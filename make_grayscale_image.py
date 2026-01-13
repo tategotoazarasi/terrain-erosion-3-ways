@@ -1,7 +1,5 @@
 #!/usr/bin/python3
 
-# Genreates a PNG containing the terrain height in grayscale.
-
 import sys
 
 import util
@@ -15,10 +13,8 @@ def main(argv):
 	input_path = argv[1]
 	output_path = argv[2]
 
-	# load_from_file now returns CuPy arrays or None
+	# Load handles FP16 automatically
 	height, _ = util.load_from_file(input_path)
-
-	# save_as_png converts CuPy array to host for saving
 	util.save_as_png(height, output_path)
 
 

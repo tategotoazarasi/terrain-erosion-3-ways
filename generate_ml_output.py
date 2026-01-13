@@ -12,9 +12,6 @@ import tensorflow as tf
 
 
 def main(argv):
-	# First argument is the path to the progressive_growing_of_gans clone.
-	# Second argument is the network weights pickle file.
-	# Third argument is the number of output samples to generate. Defaults to 20
 	if len(argv) < 3:
 		print('Usage: %s path/to/progressive_growing_of_gans weights.pkl '
 		      '[number_of_samples]' % argv[0])
@@ -30,11 +27,11 @@ def main(argv):
 	with open(weight_path, 'rb') as f:
 		G, D, Gs = pickle.load(f)
 
-	# Generate input vectors on GPU using CuPy
-	latents_gpu = cp.random.randn(num_samples, *Gs.input_shapes[0][1:])
-	# TF expects numpy or compatible interface. We move to host for TF consumption
-	# unless TF is specifically configured for DLPack/CUDA arrays directly.
-	latents = cp.asnumpy(latents_gpu)
+	# Generate input vectors on GPU using CuPy (FP16)
+	latents_gpu = cp.random.randn(num_samples, *Gs.input_shapes[0][1:], dtype=cp.float16)
+
+	# TF usually expects Float32, so we convert back to numpy float32 for the TF run
+	latents = cp.asnumpy(latents_gpu).astype(np.float32)
 
 	labels = np.zeros([latents.shape[0]] + Gs.input_shapes[1][1:])
 
@@ -49,15 +46,14 @@ def main(argv):
 		pass
 
 	# Write outputs.
-	# We move the result to GPU to do the clip/squeeze/normalization logic
-	# assuming the batch size might be large enough to warrant it, then save.
-	samples_gpu = cp.asarray(samples)
+	# Move to GPU and cast to FP16 for post-processing
+	samples_gpu = cp.asarray(samples, dtype=cp.float16)
 
 	for idx in range(samples_gpu.shape[0]):
 		sample_gpu = (cp.clip(cp.squeeze((samples_gpu[idx, 0, :, :] + 1.0) / 2), 0.0, 1.0)
-		              .astype('float64'))
+		              .astype(cp.float16))
 
-		# Save expects host memory
+		# Save as FP16 .npy
 		np.save(os.path.join(output_dir, '%d.npy' % idx), cp.asnumpy(sample_gpu))
 
 

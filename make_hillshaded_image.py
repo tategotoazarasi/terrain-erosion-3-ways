@@ -1,7 +1,5 @@
 #!/usr/bin/python3
 
-# Genreates a PNG containing a hillshaded version of the terrain height.
-
 import sys
 
 import util
@@ -16,8 +14,6 @@ def main(argv):
 	output_path = argv[2]
 
 	height, land_mask = util.load_from_file(input_path)
-
-	# util.hillshaded handles the necessary logic (CPU/GPU interop) for shading
 	util.save_as_png(util.hillshaded(height, land_mask=land_mask), output_path)
 
 

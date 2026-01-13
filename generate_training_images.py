@@ -1,7 +1,7 @@
 #!/usr/bin/python
 
 # Reads the Numpy arrays in array_files/ and generates images for use in
-# training. Please note that this script takes a long time to run.
+# training.
 
 import os
 import sys
@@ -14,43 +14,33 @@ import skimage.measure
 import util
 
 
-# Filters and cleans the given sample. Uses rough heuristics to determine which
-# samples are suitable for training via rough heuristics.
+# Filters and cleans the given sample.
 def clean_sample(sample_gpu):
-	# Note: This function receives a CuPy array.
+	# Using FP16
+	sample_gpu = sample_gpu.astype(cp.float16)
 
 	# Get rid of "out-of-bounds" magic values.
-	sample_gpu[sample_gpu == cp.finfo('float32').min] = 0.0
+	# Standard finfo for float32 min often used as magic value, check compat with float16
+	min_val = cp.finfo('float32').min
+	sample_gpu[sample_gpu <= (min_val + 1000)] = 0.0  # Approximate check due to precision
 
-	# Ignore any samples with NaNs, for one reason or another.
 	if cp.isnan(sample_gpu).any(): return None
 
-	# Only accept values that span a given range. This is to capture more
-	# mountainous samples.
 	if (sample_gpu.max() - sample_gpu.min()) < 40: return None
 
-	# Filter out samples for which a significant portion is within a small
-	# threshold from the minimum value. This helps filter out samples that
-	# contain a lot of water.
 	near_min_fraction = (sample_gpu < (sample_gpu.min() + 8)).sum() / sample_gpu.size
 	if near_min_fraction > 0.2: return None
 
-	# Low entropy samples likely have some file corruption or some other artifact
-	# that would make it unsuitable as a training sample.
-	# Entropy calculation is complex to vectorize efficiently on GPU without
-	# custom kernels for histogramming, so we pull to CPU for this check.
-	sample_cpu = cp.asnumpy(sample_gpu)
+	sample_cpu = cp.asnumpy(sample_gpu).astype(np.float32)
 	entropy = skimage.measure.shannon_entropy(sample_cpu)
 	if entropy < 10.0: return None
 
 	return util.normalize(sample_gpu)
 
 
-# This function returns rotated and flipped variants of the provided array. This
-# increases the number of training samples by a factor of 8.
 def get_variants(a_gpu):
-	for b_gpu in (a_gpu, a_gpu.T):  # Original and flipped.
-		for k in range(0, 4):  # Rotated 90 degrees x 4
+	for b_gpu in (a_gpu, a_gpu.T):
+		for k in range(0, 4):
 			yield cp.rot90(b_gpu, k)
 
 
@@ -62,7 +52,6 @@ def main(argv):
 	sample_shape = (sample_dim,) * 2
 	sample_area = np.prod(sample_shape)
 
-	# Create the training sample directory, if it doesn't already exist.
 	try:
 		os.mkdir(training_samples_dir)
 	except:
@@ -76,11 +65,9 @@ def main(argv):
 		print('(%d / %d) Created %d samples so far'
 		      % (index + 1, len(source_array_paths), training_id))
 
-		# Load data. This is usually stored as .npz by extract_height_arrays.
-		# We load it into host memory first because we need CV2 for resizing.
+		# Load data (likely saved as float16 from extract_height_arrays)
 		data = np.load(source_array_path)
 
-		# Load heightmap and correct for latitude (to an approximation)
 		source_array_raw = data['height']
 		latitude_deg = (data['minY'] + data['maxY']) / 2
 		latitude_correction = np.cos(np.radians(latitude_deg))
@@ -88,13 +75,12 @@ def main(argv):
 			int(np.round(source_array_raw.shape[0] * latitude_correction)),
 			source_array_raw.shape[1])
 
-		# cv2.resize is CPU based.
-		source_array_cpu = cv2.resize(source_array_raw, source_array_shape)
+		# Resize on CPU (float32 usually better for resizing quality then cast back)
+		source_array_cpu = cv2.resize(source_array_raw.astype(np.float32), source_array_shape)
 
-		# Move to GPU for slicing and heuristics
-		source_array = cp.asarray(source_array_cpu)
+		# Move to GPU as FP16
+		source_array = cp.asarray(source_array_cpu, dtype=cp.float16)
 
-		# Determine the number of samples to use per source array.
 		sampleable_area = np.subtract(source_array_shape, sample_shape).prod()
 		samples_per_array = int(np.ceil(sampleable_area / sample_area))
 
@@ -103,21 +89,17 @@ def main(argv):
 			continue
 
 		for _ in range(samples_per_array):
-			# Select a sample from the source array.
 			row = np.random.randint(source_array.shape[0] - sample_shape[0])
 			col = np.random.randint(source_array.shape[1] - sample_shape[1])
 			sample = source_array[row:(row + sample_shape[0]),
 			col:(col + sample_shape[1])]
 
-			# Scale and clean the sample (mostly on GPU)
 			sample = clean_sample(sample)
 
-			# Write the sample to a file
 			if sample is not None:
 				for variant in get_variants(sample):
 					output_path = os.path.join(
 						training_samples_dir, str(training_id) + '.png')
-					# util.save_as_png handles the download from GPU
 					util.save_as_png(variant, output_path)
 
 					training_id += 1

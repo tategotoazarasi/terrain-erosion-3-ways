@@ -69,3 +69,4 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 # 6. Run Benchmark
 python simulation.py
 python make_hillshaded_image.py simulation.npy output.png
+echo "DONE"

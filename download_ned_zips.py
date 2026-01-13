@@ -1,16 +1,12 @@
 #!/usr/bin/python3
 
-# Script to hep in downloading files from USGS. The input file is a CSV
-# of 3DEP IMG resources downloaded from https://viewer.nationalmap.gov/basic/
-# This script is really a poor man's download manager; use any solution you
-# prefer.
-#
-# NOTE: This script is I/O bound and does not utilize CuPy.
+# Script to hep in downloading files from USGS.
+# IO Bound, no changes needed for FP16, but kept for completeness.
 
 import os
 import shutil
 import sys
-import urllib.request  # Updated for Python 3 compatibility
+import urllib.request
 
 import util
 
@@ -21,9 +17,6 @@ def get_previously_downloaded_ids(dir_path):
 	            for file_path in os.listdir(dir_path)))
 
 
-# Download the file for `src_id` from `url` to `output_dir`. Uses `tmp_dir` an
-# intermediate so that aborted downloads are not included in
-# get_previously_downloaded_ids above.
 def download_file(src_id, url, output_dir, tmp_dir):
 	output_file = src_id + '.zip'
 	tmp_path = os.path.join(tmp_dir, output_file)

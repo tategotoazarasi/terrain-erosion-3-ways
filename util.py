@@ -17,57 +17,63 @@ def read_csv(csv_path):
 		return list(csv.DictReader(csv_file))
 
 
-# Renormalizes the values of `x` to `bounds` (GPU compatible)
+# Renormalizes the values of `x` to `bounds` (GPU compatible, FP16 friendly)
 def normalize(x, bounds=(0, 1)):
 	# Fix 1: Ensure input x is C-contiguous.
 	if not x.flags.c_contiguous:
 		x = cp.ascontiguousarray(x)
 
-	# Fix 2: cp.interp requires xp and fp to be arrays, not tuples.
+	# Fix 2: cp.interp requires xp and fp to be arrays.
+	# We perform interpolation in the native dtype of x (likely FP16).
 	xp = cp.stack([x.min(), x.max()])
-	fp = cp.asarray(bounds)
+	fp = cp.asarray(bounds, dtype=x.dtype)
 
-	return cp.interp(x, xp, fp)
+	return cp.interp(x, xp, fp).astype(x.dtype)
 
 
 # Fourier-based power law noise with frequency bounds. (GPU Accelerated)
 def fbm(shape, p, lower=-cp.inf, upper=cp.inf):
-	# np.fft -> cp.fft
+	# FFT operations in CuPy generally use float32/complex64 minimum.
+	# We perform the generation in standard precision, then cast result to FP16.
+
 	freqs = tuple(cp.fft.fftfreq(n, d=1.0 / n) for n in shape)
 	freq_radial = cp.hypot(*cp.meshgrid(*freqs))
 	envelope = (cp.power(freq_radial, p) *
 	            (freq_radial > lower) * (freq_radial < upper))
-	# Fix for potential divide by zero in power, and handle 0 freq
 	envelope[0][0] = 0.0
 
-	phase_noise = cp.exp(2j * cp.pi * cp.random.rand(*shape))
-	return normalize(cp.real(cp.fft.ifft2(cp.fft.fft2(phase_noise) * envelope)))
+	phase_noise = cp.exp(2j * cp.pi * cp.random.rand(*shape, dtype=cp.float32))
+
+	# Complex math happens here
+	complex_res = cp.fft.ifft2(cp.fft.fft2(phase_noise) * envelope)
+
+	# Extract real part and convert to FP16
+	return normalize(cp.real(complex_res)).astype(cp.float16)
 
 
 # Returns each value of `a` with coordinates offset by `offset`.
 # Runs on GPU.
 def sample(a, offset):
-	# FIX: Keep shape as a tuple for range/meshgrid generation on CPU side logic
+	# Shape tuple for CPU logic
 	shape_tuple = a.shape
-	# Create a GPU array version for the modulo arithmetic below
+	# Shape GPU for broadcasting
 	shape_gpu = cp.array(shape_tuple)
 
 	delta = cp.array((offset.real, offset.imag))
 
-	# Create grid on GPU
-	# We use cp.arange on the tuple dimensions to generate coordinates directly on device
+	# Grid generation
 	grid_vectors = [cp.arange(n) for n in shape_tuple]
-	# Note: Original code used np.meshgrid(*map(range, shape)), which defaults to indexing='xy'
 	coords = cp.array(cp.meshgrid(*grid_vectors)) - delta
 
 	lower_coords = cp.floor(coords).astype(int)
 	upper_coords = lower_coords + 1
-	coord_offsets = coords - lower_coords
+	coord_offsets = (coords - lower_coords).astype(a.dtype)  # Use FP16 if a is FP16
 
-	# Use shape_gpu for broadcasting modulo
+	# Modulo
 	lower_coords %= shape_gpu[:, cp.newaxis, cp.newaxis]
 	upper_coords %= shape_gpu[:, cp.newaxis, cp.newaxis]
 
+	# Lerp will return same dtype as inputs
 	result = lerp(lerp(a[lower_coords[1], lower_coords[0]],
 	                   a[lower_coords[1], upper_coords[0]],
 	                   coord_offsets[0]),
@@ -79,67 +85,66 @@ def sample(a, offset):
 
 
 # Takes each value of `a` and offsets them by `delta`.
-# Runs on GPU.
 def displace(a, delta):
 	fns = {
 		-1: lambda x: -x,
 		0: lambda x: 1 - cp.abs(x),
 		1 : lambda x: x,
 	}
+	# Ensure result matches input dtype (FP16)
 	result = cp.zeros_like(a)
 	for dx in range(-1, 2):
-		wx = cp.maximum(fns[dx](delta.real), 0.0)
+		wx = cp.maximum(fns[dx](delta.real), 0.0).astype(a.dtype)
 		for dy in range(-1, 2):
-			wy = cp.maximum(fns[dy](delta.imag), 0.0)
-			# cp.roll instead of np.roll
+			wy = cp.maximum(fns[dy](delta.imag), 0.0).astype(a.dtype)
 			result += cp.roll(cp.roll(wx * wy * a, dy, axis=0), dx, axis=1)
 
 	return result
 
 
 # Returns the gradient of the gaussian blur of `a` encoded as a complex number.
-# Runs on GPU via FFT.
 def gaussian_gradient(a, sigma=1.0):
+	# Force float32 for FFT calculation precision, then cast back if needed outside
 	[fy, fx] = cp.meshgrid(*(cp.fft.fftfreq(n, 1.0 / n) for n in a.shape))
 	sigma2 = sigma ** 2
 	g = lambda x: ((2 * cp.pi * sigma2) ** -0.5) * cp.exp(-0.5 * (x / sigma) ** 2)
 	dg = lambda x: g(x) * (x / sigma2)
 
-	fa = cp.fft.fft2(a)
+	fa = cp.fft.fft2(a.astype(cp.complex64))
 	dy = cp.fft.ifft2(cp.fft.fft2(dg(fy) * g(fx)) * fa).real
 	dx = cp.fft.ifft2(cp.fft.fft2(g(fy) * dg(fx)) * fa).real
+
+	# Return complex64 (FP32 parts)
 	return 1j * dx + dy
 
 
-# Simple gradient by taking the diff of each cell's horizontal and vertical neighbors.
-# Runs on GPU.
+# Simple gradient.
 def simple_gradient(a):
 	dx = 0.5 * (cp.roll(a, 1, axis=0) - cp.roll(a, -1, axis=0))
 	dy = 0.5 * (cp.roll(a, 1, axis=1) - cp.roll(a, -1, axis=1))
-	return 1j * dx + dy
+	# Return complex64
+	return (1j * dx + dy).astype(cp.complex64)
 
 
 # Loads the terrain height array.
-# Handles Numpy (.npy/.npz) files and moves them to CuPy arrays.
 def load_from_file(path):
-	# np.load handles reading the file, we then move to GPU.
 	result = np.load(path)
 	if isinstance(result, np.lib.npyio.NpzFile):
-		# Load specific keys to GPU
-		return (cp.asarray(result['height']), cp.asarray(result['land_mask']))
+		# Load specific keys to GPU as FP16
+		return (cp.asarray(result['height'], dtype=cp.float16),
+		        cp.asarray(result['land_mask']))
 	else:
-		return (cp.asarray(result), None)
+		return (cp.asarray(result, dtype=cp.float16), None)
 
 
-# Saves the array as a PNG image. Assumes all input values are [0, 1]
-# Transfers from GPU to CPU for saving.
+# Saves the array as a PNG image.
 def save_as_png(a, path):
-	a_cpu = cp.asnumpy(a)
+	a_cpu = cp.asnumpy(a).astype(np.float32)  # Convert to standard float for Image
 	image = Image.fromarray(np.round(a_cpu * 255).astype('uint8'))
 	image.save(path)
 
 
-# Creates a hillshaded RGB array of heightmap `a`.
+# Creates a hillshaded RGB array.
 _TERRAIN_CMAP = LinearSegmentedColormap.from_list('my_terrain', [
 	(0.00, (0.15, 0.3, 0.15)),
 	(0.25, (0.3, 0.45, 0.3)),
@@ -149,13 +154,10 @@ _TERRAIN_CMAP = LinearSegmentedColormap.from_list('my_terrain', [
 ])
 
 
-# Hillshading using Matplotlib (CPU based).
-# Transfers inputs to CPU, computes, returns GPU array if needed,
-# but usually this is used right before saving.
 def hillshaded(a, land_mask=None, angle=270):
 	if land_mask is None: land_mask = cp.ones_like(a)
 
-	a_cpu = cp.asnumpy(a)
+	a_cpu = cp.asnumpy(a).astype(np.float32)
 	land_mask_cpu = cp.asnumpy(land_mask)
 
 	ls = LightSource(azdeg=angle, altdeg=30)
@@ -165,16 +167,12 @@ def hillshaded(a, land_mask=None, angle=270):
 	water = np.tile((0.25, 0.35, 0.55), a_cpu.shape + (1,))
 	result_cpu = lerp(water, land, land_mask_cpu[:, :, np.newaxis])
 
-	return cp.asarray(result_cpu)
+	return cp.asarray(result_cpu, dtype=cp.float16)
 
 
-# Linear interpolation of `x` to `y` with respect to `a`
-# Works on both Numpy and CuPy arrays
 def lerp(x, y, a): return (1.0 - a) * x + a * y
 
 
-# Returns a list of grid coordinates for every (x, y) position bounded by `shape`.
-# Returns CuPy array.
 def make_grid_points(shape):
 	[Y, X] = cp.meshgrid(cp.arange(shape[0]), cp.arange(shape[1]))
 	grid_points = cp.column_stack([X.flatten(), Y.flatten()])
@@ -182,15 +180,11 @@ def make_grid_points(shape):
 
 
 # Returns a list of points sampled within the bounds of `shape`.
-# NOTE: This uses sequential CPU logic. We return a Numpy array
-# because downstream usage (Delaunay) often requires CPU data.
 def poisson_disc_sampling(shape, radius, retries=16):
 	grid = {}
 	points = []
 
-	# The bounds of `shape` are divided into a grid of cells.
 	cell_size = radius / np.sqrt(2)
-	# Use numpy for the shape math here
 	cells = np.ceil(np.divide(shape, cell_size)).astype(int)
 	offsets = [(0, 0), (0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (-1, 1),
 	           (1, -1), (1, 1), (-2, 0), (2, 0), (0, -2), (0, 2)]
@@ -213,7 +207,6 @@ def poisson_disc_sampling(shape, radius, retries=16):
 		points.append(p)
 
 	q = collections.deque()
-	# Random generation on CPU for this specific sequential algo
 	first = np.array(shape) * np.random.rand(2)
 	add_point(first)
 	while len(q) > 0:
@@ -233,12 +226,7 @@ def poisson_disc_sampling(shape, radius, retries=16):
 	return np.concatenate(points).reshape((num_points, 2))
 
 
-# Returns an array in which all True values of `mask` contain the distance to
-# the nearest False value.
-# Uses scipy.spatial.cKDTree which is CPU only.
-# Automatically handles transfer to CPU and back to GPU.
 def dist_to_mask(mask_gpu):
-	# Move to CPU
 	mask = cp.asnumpy(mask_gpu)
 
 	border_mask = (np.maximum.reduce([
@@ -248,38 +236,35 @@ def dist_to_mask(mask_gpu):
 
 	kdtree = sp.spatial.cKDTree(border_points)
 
-	# Generate grid points on CPU for the query
 	[Y, X] = np.meshgrid(np.arange(mask.shape[0]), np.arange(mask.shape[1]))
 	grid_points = np.column_stack([X.flatten(), Y.flatten()])
 
 	result = kdtree.query(grid_points)[0].reshape(mask.shape)
 
-	# Return to GPU
-	return cp.asarray(result)
+	# Return FP16
+	return cp.asarray(result, dtype=cp.float16)
 
 
-# Generates worley noise with points separated by `spacing`.
 def worley(shape, spacing):
-	# Poisson returns Numpy
 	points = poisson_disc_sampling(shape, spacing)
 	coords = np.floor(points).astype(int)
 
-	# Create mask on GPU
 	mask = cp.zeros(shape, dtype=bool)
-	# Must use host indices to set values on device array, or move coords to device
 	coords_gpu = cp.asarray(coords)
 	mask[coords_gpu[:, 0], coords_gpu[:, 1]] = True
 
-	return normalize(dist_to_mask(mask))
+	return normalize(dist_to_mask(mask)).astype(cp.float16)
 
 
-# Peforms a gaussian blur of `a`.
-# Uses FFT on GPU.
 def gaussian_blur(a, sigma=1.0):
+	# Calc in complex64/float32
 	freqs = tuple(cp.fft.fftfreq(n, d=1.0 / n) for n in a.shape)
 	freq_radial = cp.hypot(*cp.meshgrid(*freqs))
 	sigma2 = sigma ** 2
 	g = lambda x: ((2 * cp.pi * sigma2) ** -0.5) * cp.exp(-0.5 * (x / sigma) ** 2)
 	kernel = g(freq_radial)
 	kernel /= kernel.sum()
-	return cp.fft.ifft2(cp.fft.fft2(a) * cp.fft.fft2(kernel)).real
+
+	# Cast back result to FP16
+	res = cp.fft.ifft2(cp.fft.fft2(a.astype(cp.complex64)) * cp.fft.fft2(kernel)).real
+	return res.astype(cp.float16)

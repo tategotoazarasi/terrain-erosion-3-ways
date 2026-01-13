@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 # Semi-phisically-based hydraulic erosion simulation.
+# FULL FP16 IMPLEMENTATION
 
 import os
 import sys
@@ -11,15 +12,12 @@ import numpy as np
 import util
 
 
-# Smooths out slopes of `terrain` that are too steep.
 def apply_slippage(terrain, repose_slope, cell_width):
 	delta = util.simple_gradient(terrain) / cell_width
 	smoothed = util.gaussian_blur(terrain, sigma=1.5)
 
-	# FIX: Use cp.where instead of cp.select to avoid "default only accepts scalar" error
-	# result = cp.select([cp.abs(delta) > repose_slope], [smoothed], terrain)
 	result = cp.where(cp.abs(delta) > repose_slope, smoothed, terrain)
-	return result
+	return result.astype(cp.float16)
 
 
 def main(argv):
@@ -59,60 +57,40 @@ def main(argv):
 	# The numer of iterations is proportional to the grid dimension.
 	iterations = int(1.4 * dim)
 
-	# `terrain` represents the actual terrain height we're interested in
-	# Everything is on GPU via util.fbm returning a CuPy array
-	terrain = util.fbm(shape, -2.0)
-
-	# `sediment` is the amount of suspended "dirt" in the water.
-	sediment = cp.zeros_like(terrain)
-
-	# The amount of water. Responsible for carrying sediment.
-	water = cp.zeros_like(terrain)
-
-	# The water velocity.
-	velocity = cp.zeros_like(terrain)
+	# --- FP16 Initialization ---
+	terrain = util.fbm(shape, -2.0).astype(cp.float16)
+	sediment = cp.zeros_like(terrain, dtype=cp.float16)
+	water = cp.zeros_like(terrain, dtype=cp.float16)
+	velocity = cp.zeros_like(terrain, dtype=cp.float16)
 
 	for i in range(0, iterations):
 		print('%d / %d' % (i + 1, iterations))
 
 		# Add precipitation.
-		water += cp.random.rand(*shape) * rain_rate
+		water += (cp.random.rand(*shape, dtype=cp.float32) * rain_rate).astype(cp.float16)
 
-		# Compute the normalized gradient of the terrain height
-		gradient = cp.zeros_like(terrain, dtype='complex128')
-		gradient = util.simple_gradient(terrain)
+		# Compute the normalized gradient.
+		# Note: Complex numbers must be at least complex64 (2x float32),
+		# we assume float16 terrain can be cast to that for calc.
+		gradient = cp.zeros_like(terrain, dtype=cp.complex64)
+		gradient = util.simple_gradient(terrain)  # returns complex (likely complex64 from op)
 
-		# FIX: Use cp.where instead of cp.select
-		# gradient = cp.select([cp.abs(gradient) < 1e-10],
-		#                      [cp.exp(2j * cp.pi * cp.random.rand(*shape))],
-		#                      gradient)
-		random_gradient = cp.exp(2j * cp.pi * cp.random.rand(*shape))
+		# Generate random direction in complex64
+		random_gradient = cp.exp(2j * cp.pi * cp.random.rand(*shape, dtype=cp.float32)).astype(cp.complex64)
+
 		gradient = cp.where(cp.abs(gradient) < 1e-10, random_gradient, gradient)
-
 		gradient /= cp.abs(gradient)
 
-		# Compute the difference between teh current height the height offset by
-		# `gradient`.
-		neighbor_height = util.sample(terrain, -gradient)
+		# Gradient is complex64, terrain is float16.
+		# util.sample handles this, but returns promoted types potentially.
+		# We force cast back to float16.
+		neighbor_height = util.sample(terrain, -gradient).astype(cp.float16)
 		height_delta = terrain - neighbor_height
 
-		# The sediment capacity represents how much sediment can be suspended in
-		# water.
+		# Calculation in FP16
 		sediment_capacity = (
 				(cp.maximum(height_delta, min_height_delta) / cell_width) * velocity *
 				water * sediment_capacity_constant)
-
-		# FIX: Use nested cp.where instead of cp.select
-		# deposited_sediment = cp.select(
-		# 	[
-		# 		height_delta < 0,
-		# 		sediment > sediment_capacity,
-		# 	], [
-		# 		cp.minimum(height_delta, sediment),
-		# 		deposition_rate * (sediment - sediment_capacity),
-		# 	],
-		# 	# If sediment <= sediment_capacity
-		# 	dissolving_rate * (sediment - sediment_capacity))
 
 		val_if_negative_delta = cp.minimum(height_delta, sediment)
 		val_if_over_capacity = deposition_rate * (sediment - sediment_capacity)
@@ -126,16 +104,17 @@ def main(argv):
 				val_if_over_capacity,
 				val_else
 			)
-		)
+		).astype(cp.float16)
 
-		# Don't erode more sediment than the current terrain height.
 		deposited_sediment = cp.maximum(-height_delta, deposited_sediment)
 
 		# Update terrain and sediment quantities.
 		sediment -= deposited_sediment
 		terrain += deposited_sediment
-		sediment = util.displace(sediment, gradient)
-		water = util.displace(water, gradient)
+
+		# Displace returns float16 if input is float16
+		sediment = util.displace(sediment, gradient).astype(cp.float16)
+		water = util.displace(water, gradient).astype(cp.float16)
 
 		# Smooth out steep slopes.
 		terrain = apply_slippage(terrain, repose_slope, cell_width)
@@ -144,14 +123,13 @@ def main(argv):
 		velocity = gravity * height_delta / cell_width
 
 		# Apply evaporation
-		water *= 1 - evaporation_rate
+		water *= (1 - evaporation_rate)
 
 		# Snapshot, if applicable.
 		if enable_snapshotting:
 			output_path = os.path.join(snapshot_dir, snapshot_file_template % i)
 			util.save_as_png(terrain, output_path)
 
-	# Normalize on GPU then save (save_as_png handles download or np.save handles it)
 	np.save('simulation', cp.asnumpy(util.normalize(terrain)))
 
 

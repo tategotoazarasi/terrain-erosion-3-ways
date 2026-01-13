@@ -2,9 +2,7 @@
 
 # Extracts the underlying heightmap in each file in zip_files/ and writes the
 # numpy array to array_files/
-#
-# NOTE: Uses CPU-based GDAL and ZipFile. Saves as standard Numpy .npz files
-# to be compatible with other tools, though CuPy can load them.
+# Modified to save as float16 to save space.
 
 import json
 import os
@@ -20,7 +18,7 @@ from osgeo import gdal
 import util
 
 
-# Extracts the IMG file from the ZIP archive and returns a Numpy array, or None # if reading or parsing failed.
+# Extracts the IMG file from the ZIP archive and returns a Numpy array
 def get_img_array_from_zip(zip_file, img_name):
 	with tempfile.NamedTemporaryFile() as temp_file:
 		# Copy to temp file.
@@ -29,7 +27,10 @@ def get_img_array_from_zip(zip_file, img_name):
 
 		# Extract as numpy array.
 		geo = gdal.Open(temp_file.name)
-		return geo.ReadAsArray() if geo is not None else None
+		if geo is not None:
+			# Cast to float16 immediately after reading
+			return geo.ReadAsArray().astype(np.float16)
+		return None
 
 
 def main(argv):
@@ -69,8 +70,7 @@ def main(argv):
 				if len(ext_names) > 1:
 					print('More than one IMG file found for %s: %s' % (src_id, ext_names))
 
-				# Get the bounding box. The string manipulation is required given that
-				# the provided dict is not proper JSON
+				# Get the bounding box.
 				bounding_box_raw = entry['boundingBox']
 				bounding_box_json = re.sub(r'([a-zA-Z]+):', r'"\1":', bounding_box_raw)
 				bounding_box = json.loads(bounding_box_json)

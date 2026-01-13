@@ -1,11 +1,9 @@
 #!/usr/bin/python3
 
-# A demo of ridge noise.
-
 import sys
 
 import cupy as cp
-import numpy as np  # For saving
+import numpy as np
 
 import util
 
@@ -17,7 +15,8 @@ def noise_octave(shape, f):
 def main(argv):
 	shape = (512,) * 2
 
-	values = cp.zeros(shape)
+	# Compute in FP16
+	values = cp.zeros(shape, dtype=cp.float16)
 	for p in range(1, 10):
 		a = 2 ** p
 		values += cp.abs(noise_octave(shape, a) - 0.5) / a
