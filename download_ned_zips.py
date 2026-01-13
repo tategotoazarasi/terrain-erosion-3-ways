@@ -1,45 +1,48 @@
 #!/usr/bin/python3
 
-# Script to help in downloading files from USGS.
-# IO-bound script, kept mostly standard Python/NumPy but updated for Python 3 robustness.
+# Script to hep in downloading files from USGS. The input file is a CSV
+# of 3DEP IMG resources downloaded from https://viewer.nationalmap.gov/basic/
+# This script is really a poor man's download manager; use any solution you
+# prefer.
+#
+# NOTE: This script is I/O bound and does not utilize CuPy.
 
 import os
 import shutil
 import sys
-import urllib.error
-import urllib.request
+import urllib.request  # Updated for Python 3 compatibility
 
 import util
 
 
 # Gets list of src ids of previously downloaded files.
 def get_previously_downloaded_ids(dir_path):
-	if not os.path.exists(dir_path):
-		return set()
 	return set((os.path.splitext(file_path)[0]
 	            for file_path in os.listdir(dir_path)))
 
 
-# Download the file.
+# Download the file for `src_id` from `url` to `output_dir`. Uses `tmp_dir` an
+# intermediate so that aborted downloads are not included in
+# get_previously_downloaded_ids above.
 def download_file(src_id, url, output_dir, tmp_dir):
 	output_file = src_id + '.zip'
 	tmp_path = os.path.join(tmp_dir, output_file)
 
 	# Download and save to temp dir
 	try:
-		# Python 3 uses urllib.request
 		urllib.request.urlretrieve(url, tmp_path)
-	except (urllib.error.URLError, IOError) as e:
-		print(f"Error downloading {url}: {e}")
+	except IOError as e:
+		print(e)
 		return False
 
 	# Move file in temp dir to final output dir
 	shutil.move(tmp_path, output_dir)
+
 	return True
 
 
 def main(argv):
-	my_dir = os.path.dirname(os.path.abspath(argv[0]))
+	my_dir = os.path.dirname(argv[0])
 	output_dir = os.path.join(my_dir, 'zip_files')
 	tmp_dir = '/tmp'
 
@@ -50,8 +53,8 @@ def main(argv):
 	csv_path = argv[1]
 
 	try:
-		os.makedirs(output_dir, exist_ok=True)
-	except OSError:
+		os.mkdir(output_dir)
+	except:
 		pass
 
 	downloaded_ids = get_previously_downloaded_ids(output_dir)

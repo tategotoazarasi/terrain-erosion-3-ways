@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# Generates a PNG containing a hillshaded version of the terrain height.
+# Genreates a PNG containing a hillshaded version of the terrain height.
 
 import sys
 
@@ -17,11 +17,8 @@ def main(argv):
 
 	height, land_mask = util.load_from_file(input_path)
 
-	# Use the util function (which uses matplotlib on CPU)
-	# Hillshading is fast enough on CPU for single images, and Matplotlib logic is complex to port to JAX
-	rgb_array = util.hillshaded(height, land_mask=land_mask)
-
-	util.save_as_png(rgb_array, output_path)
+	# util.hillshaded handles the necessary logic (CPU/GPU interop) for shading
+	util.save_as_png(util.hillshaded(height, land_mask=land_mask), output_path)
 
 
 if __name__ == '__main__':

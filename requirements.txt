@@ -14,3 +14,5 @@ tensorflow
 tensorflow-gpu
 tensorflow-tensorboard
 urllib3
+cupy-cuda12x
+jax[cuda12]
