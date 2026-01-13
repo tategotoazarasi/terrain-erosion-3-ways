@@ -1,11 +1,13 @@
 #!/usr/bin/python3
 
-# Genreates a PNG containing the terrain height in grayscale.
+# Generates a PNG containing the terrain height in grayscale.
 
 import sys
 
 import util
 
+
+# Note: util.save_as_png expects standard numpy arrays or will convert them
 
 def main(argv):
 	if len(argv) != 3:
@@ -15,7 +17,13 @@ def main(argv):
 	input_path = argv[1]
 	output_path = argv[2]
 
+	# Load returns numpy arrays (CPU)
 	height, _ = util.load_from_file(input_path)
+
+	# Normalize if needed for PNG
+	if height.max() > 1.0 or height.min() < 0.0:
+		height = util.normalize_np(height)
+
 	util.save_as_png(height, output_path)
 
 

@@ -1,0 +1,16 @@
+# GDAL is a bit janky, so you may have to compile and install yourself.
+# See https://trac.osgeo.org/gdal/wiki/DownloadSource
+GDAL
+matplotlib
+numpy
+opencv-python
+Pillow
+scikit-image
+scipy
+six
+# You will also have to install CUDA and cuDNN drivers for tensorflow to work.
+tensorboard
+tensorflow
+tensorflow-gpu
+tensorflow-tensorboard
+urllib3

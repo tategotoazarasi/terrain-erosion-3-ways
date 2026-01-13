@@ -1,11 +1,20 @@
 #!/usr/bin/python3
 
+# River network generation.
+# NOTE: This file uses SciPy's Delaunay triangulation and Python's heapq.
+# These algorithms are inherently sequential/CPU-bound or require dynamic data structures
+# that do not map well to JAX/GPU static graphs.
+# We utilize JAX for the initial terrain generation (FBM, bumps), but keep the
+# graph traversal logic in NumPy/CPU for correctness and stability.
+
 import heapq
 import sys
 
-import matplotlib
+import jax
+import jax.numpy as jnp
+import matplotlib.tri
 import numpy as np
-import scipy as sp
+import scipy.spatial as sp
 import skimage.measure
 
 import util
@@ -15,16 +24,18 @@ import util
 def min_index(a): return a.index(min(a))
 
 
-# Returns an array with a bump centered in the middle of `shape`. `sigma`
-# determines how wide the bump is.
+# Returns an array with a bump centered in the middle of `shape`.
+# Accelerated with JAX
+@jax.jit
 def bump(shape, sigma):
-	[y, x] = np.meshgrid(*map(np.arange, shape))
-	r = np.hypot(x - shape[0] / 2, y - shape[1] / 2)
+	y, x = jnp.meshgrid(jnp.arange(shape[0]), jnp.arange(shape[1]), indexing='ij')
+	r = jnp.hypot(x - shape[0] / 2, y - shape[1] / 2)
 	c = min(shape) / 2
-	return np.tanh(np.maximum(c - r, 0.0) / sigma)
+	return jnp.tanh(jnp.maximum(c - r, 0.0) / sigma)
 
 
 # Returns a list of heights for each point in `points`.
+# Graph algorithm (Dijkstra-like) -> Keep on CPU
 def compute_height(points, neighbors, deltas, get_delta_fn=None):
 	if get_delta_fn is None:
 		get_delta_fn = lambda src, dst: deltas[dst]
@@ -41,19 +52,17 @@ def compute_height(points, neighbors, deltas, get_delta_fn=None):
 		for n in neighbors[idx]:
 			if result[n] is not None: continue
 			heapq.heappush(q, (get_delta_fn(idx, n) + height, n))
-	return util.normalize(np.array(result))
+
+	# Convert result to numpy array replacing None with 0 (should cover all though)
+	res_array = np.array([r if r is not None else 0.0 for r in result])
+	return util.normalize_np(res_array)
 
 
-# Same as above, but computes height taking into account river downcutting.
-# `max_delta` determines the maximum difference in neighboring points (to
-# give the effect of talus slippage). `river_downcutting_constant` affects how
-# deeply rivers cut into terrain (higher means more downcutting).
 def compute_final_height(points, neighbors, deltas, volume, upstream,
                          max_delta, river_downcutting_constant):
 	dim = len(points)
-	result = [None] * dim
-	seed_idx = min_index([sum(p) for p in points])
-	q = [(0.0, seed_idx)]
+
+	# result = [None] * dim
 
 	def get_delta(src, dst):
 		v = volume[dst] if (dst in upstream[src]) else 0.0
@@ -64,21 +73,7 @@ def compute_final_height(points, neighbors, deltas, volume, upstream,
 
 
 # Computes the river network that traverses the terrain.
-#   Arguments:
-#   * points: The (x,y) coordinates of each point
-#   * neghbors: Set of each neighbor index for each point.
-#   * heights: The height of each point.
-#   * land: Indicates whether each point is on land or water.
-#   * directional_interta: indicates how straight the rivers are
-#       (0 = no directional inertia, 1 = total directional inertia).
-#   * default_water_level: How much water is assigned by default to each point
-#   * evaporation_rate: How much water is evaporated as it traverses from along
-#       each river edge.
-#  
-#  Returns a 3-tuple of:
-#  * List of indices of all points upstream from each point 
-#  * List containing the index of the point downstream of each point.
-#  * The water volume of each point.
+# CPU Bound Logic
 def compute_river_network(points, neighbors, heights, land,
                           directional_inertia, default_water_level,
                           evaporation_rate):
@@ -89,8 +84,6 @@ def compute_river_network(points, neighbors, heights, land,
 		delta = points[j] - points[i]
 		return delta / np.linalg.norm(delta)
 
-	# Initialize river priority queue with all edges between non-land points to
-	# land points. Each entry is a tuple of (priority, (i, j, river direction))
 	q = []
 	roots = set()
 	for i in range(num_points):
@@ -102,41 +95,30 @@ def compute_river_network(points, neighbors, heights, land,
 			heapq.heappush(q, (-1.0, (i, j, unit_delta(i, j))))
 		if is_root: roots.add(i)
 
-	# Compute the map of each node to its downstream node.
 	downstream = [None] * num_points
 
 	while len(q) > 0:
 		(_, (i, j, direction)) = heapq.heappop(q)
 
-		# Assign i as being downstream of j, assuming such a point doesn't
-		# already exist.
 		if downstream[j] is not None: continue
 		downstream[j] = i
 
-		# Go through each neighbor of upstream point j.
 		for k in neighbors[j]:
-			# Ignore neighbors that are lower than the current point, or who already
-			# have an assigned downstream point.
 			if (heights[k] < heights[j] or downstream[k] is not None
 					or not land[k]):
 				continue
 
-			# Edges that are aligned with the current direction vector are
-			# prioritized.
 			neighbor_direction = unit_delta(j, k)
 			priority = -np.dot(direction, neighbor_direction)
 
-			# Add new edge to queue.
 			weighted_direction = util.lerp(neighbor_direction, direction,
 			                               directional_inertia)
 			heapq.heappush(q, (priority, (j, k, weighted_direction)))
 
-	# Compute the mapping of each node to its upstream nodes.
 	upstream = [set() for _ in range(num_points)]
 	for i, j in enumerate(downstream):
 		if j is not None: upstream[j].add(i)
 
-	# Compute the water volume for each node.
 	volume = [None] * num_points
 
 	def compute_volume(i):
@@ -152,21 +134,21 @@ def compute_river_network(points, neighbors, heights, land,
 	return (upstream, downstream, volume)
 
 
-# Renders `values` for each triangle in `tri` on an array the size of `shape`.
+# Renders triangulation. Uses Matplotlib (CPU)
 def render_triangulation(shape, tri, values):
-	points = util.make_grid_points(shape)
+	points = util.make_grid_points_np(shape)
 	triangulation = matplotlib.tri.Triangulation(
 		tri.points[:, 0], tri.points[:, 1], tri.simplices)
 	interp = matplotlib.tri.LinearTriInterpolator(triangulation, values)
 	return interp(points[:, 0], points[:, 1]).reshape(shape).filled(0.0)
 
 
-# Removes any bodies of water completely enclosed by land.
 def remove_lakes(mask):
 	labels = skimage.measure.label(mask)
 	new_mask = np.zeros_like(mask, dtype=bool)
-	labels = skimage.measure.label(~mask, connectivity=1)
-	new_mask[labels != labels[0, 0]] = True
+	# Note: Using Scikit-Image on CPU as it handles connectivity well
+	labels_inv = skimage.measure.label(~mask, connectivity=1)
+	new_mask[labels_inv != labels_inv[0, 0]] = True
 	return new_mask
 
 
@@ -180,33 +162,57 @@ def main(argv):
 	default_water_level = 1.0
 	evaporation_rate = 0.2
 
+	key = jax.random.PRNGKey(42)
+	key1, key2 = jax.random.split(key)
+
 	print('Generating...')
 
-	print('  ...initial terrain shape')
-	land_mask = remove_lakes(
-		(util.fbm(shape, -2, lower=2.0) + bump(shape, 0.2 * dim) - 1.1) > 0)
-	coastal_dropoff = np.tanh(util.dist_to_mask(land_mask) / 80.0) * land_mask
-	mountain_shapes = util.fbm(shape, -2, lower=2.0, upper=np.inf)
-	initial_height = (
-			(util.gaussian_blur(np.maximum(mountain_shapes - 0.40, 0.0), sigma=5.0)
-			 + 0.1) * coastal_dropoff)
-	deltas = util.normalize(np.abs(util.gaussian_gradient(initial_height)))
+	print('  ...initial terrain shape (JAX accelerated)')
+	# JAX calculations
+	fbm_noise = util.fbm(key1, shape, -2, lower=2.0)
+	bump_map = bump(shape, 0.2 * dim)
 
-	print('  ...sampling points')
+	# Transfer to CPU for masking/labeling
+	base_terrain = jax.device_get(fbm_noise + bump_map - 1.1)
+	land_mask = remove_lakes(base_terrain > 0)
+
+	# Back to JAX for calculations involving masks if we wanted,
+	# but dist_to_mask is CPU based (KDTree), so stay on CPU.
+	coastal_dropoff = np.tanh(util.dist_to_mask(land_mask) / 80.0) * land_mask
+
+	# Mountain shapes on GPU
+	mountain_shapes = jax.device_get(util.fbm(key2, shape, -2, lower=2.0, upper=np.inf))
+
+	# Gaussian blur is JAX accelerated in util, but we need to marshal data
+	# Let's perform the blur on GPU
+	pre_blur = jnp.array(np.maximum(mountain_shapes - 0.40, 0.0))
+	blurred = jax.device_get(util.gaussian_blur(pre_blur, sigma=5.0))
+
+	initial_height = ((blurred + 0.1) * coastal_dropoff)
+
+	# Gradient on GPU
+	ih_gpu = jnp.array(initial_height)
+	grad = util.gaussian_gradient(ih_gpu)
+	deltas = jax.device_get(util.normalize(jnp.abs(grad)))
+
+	print('  ...sampling points (CPU)')
+	# Poisson disc is purely sequential/CPU
 	points = util.poisson_disc_sampling(shape, disc_radius)
 	coords = np.floor(points).astype(int)
 
-	print('  ...delaunay triangulation')
+	print('  ...delaunay triangulation (CPU)')
 	tri = sp.spatial.Delaunay(points)
 	(indices, indptr) = tri.vertex_neighbor_vertices
 	neighbors = [indptr[indices[k]:indices[k + 1]] for k in range(len(points))]
+
+	# Safe indexing on CPU
 	points_land = land_mask[coords[:, 0], coords[:, 1]]
 	points_deltas = deltas[coords[:, 0], coords[:, 1]]
 
-	print('  ...initial height map')
+	print('  ...initial height map (Graph traversal)')
 	points_height = compute_height(points, neighbors, points_deltas)
 
-	print('  ...river network')
+	print('  ...river network (Graph traversal)')
 	(upstream, downstream, volume) = compute_river_network(
 		points, neighbors, points_height, points_land,
 		directional_inertia, default_water_level, evaporation_rate)
@@ -215,6 +221,8 @@ def main(argv):
 	new_height = compute_final_height(
 		points, neighbors, points_deltas, volume, upstream,
 		max_delta, river_downcutting_constant)
+
+	print('  ...rendering')
 	terrain_height = render_triangulation(shape, tri, new_height)
 
 	np.savez('river_network', height=terrain_height, land_mask=land_mask)
