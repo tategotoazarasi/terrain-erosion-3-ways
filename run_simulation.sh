@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=32
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --time=24:00:00
 #SBATCH --partition=gpu-v100
 
 # 1. Load Modules
@@ -67,6 +67,4 @@ export OPENBLAS_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # 6. Run Benchmark
-python simulation.py
-python make_hillshaded_image.py simulation.npy output.png
-echo "DONE"
+python continuous_simulation_archiver.py $SLURM_JOB_ID.tar

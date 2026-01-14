@@ -5,6 +5,7 @@
 
 import os
 import sys
+from math import sqrt
 
 import cupy as cp
 import numpy as np
@@ -55,7 +56,7 @@ def main(argv):
 	deposition_rate = 0.001
 
 	# The numer of iterations is proportional to the grid dimension.
-	iterations = int(1.4 * dim)
+	iterations = int(sqrt(2) * dim)
 
 	# --- FP16 Initialization ---
 	terrain = util.fbm(shape, -2.0).astype(cp.float16)
