@@ -31,7 +31,7 @@ import util
 KEEP_RUNNING = True
 
 # Configuration
-DIMENSION = 8192
+DIMENSION = 512
 SEED_SCALE_FACTOR = DIMENSION / 512.0
 
 
